@@ -4,7 +4,8 @@ MessageBuilder::MessageBuilder() {
 }
 
 void MessageBuilder::buildConfigrationPayload(const char* node, 
-  const char* device_class, 
+  const char* device_class,
+  const char* state_class,
   const char* name, 
   const char* unit_of_measurement, 
   const char* value_template,
@@ -17,6 +18,7 @@ void MessageBuilder::buildConfigrationPayload(const char* node,
 
   JSONVar jpayload;
   jpayload["device_class"] = device_class;
+  jpayload["state_class"] = state_class;
   jpayload["name"] = name;
   jpayload["state_topic"] = stateTopicName;
   jpayload["json_attributes_topic"] = stateTopicName;
@@ -28,12 +30,13 @@ void MessageBuilder::buildConfigrationPayload(const char* node,
 }
 
 void MessageBuilder::getStatePayload(const char* node, float powerInWatts, 
-      float total_energy_in_kwh, float today_energy_in_kwh, char* buf, uint8_t buf_size) {
+      float today_energy_consumed_kwh, float today_energy_inserted_kwh, float today_energy_produced_kwh, char* buf, uint8_t buf_size) {
   
   JSONVar statePayload;
   statePayload["node"] = node;
-  statePayload["total_energy_kwh"] = total_energy_in_kwh;
-  statePayload["today_energy_kwh"] = today_energy_in_kwh;
+  statePayload["today_energy_consumed_kwh"] = today_energy_consumed_kwh;
+  statePayload["today_energy_inserted_kwh"] = today_energy_inserted_kwh;
+  statePayload["today_energy_produced_kwh"] = today_energy_produced_kwh;
   statePayload["power"] = powerInWatts;
   
   strcpy(buf, JSONVar::stringify(statePayload).c_str());
@@ -59,13 +62,29 @@ void MessageBuilder::getPowerConfigurationPayload(const char* node, char* payloa
   strcpy(name, node);
   strcat(name, "-Power");
 
-  buildConfigrationPayload(node, "power", name, "W", "{{value_json.power}}", payload, buff_size, tNSize);
+  buildConfigrationPayload(node, "power", "measurement", name, "W", "{{value_json.power}}", payload, buff_size, tNSize);
 }
 
-void MessageBuilder::getEnergyConfigurationPayload(const char* node, char* payload, uint16_t buff_size, uint8_t tNSize) {
+void MessageBuilder::getConsumptionConfigurationPayload(const char* node, char* payload, uint16_t buff_size, uint8_t tNSize) {
   char name[64];
   strcpy(name, node);
-  strcat(name, "-Energy");
+  strcat(name, "-Consumption");
 
-  buildConfigrationPayload(node, "energy", name, "kWh", "{{value_json.total_energy_kwh}}", payload, buff_size, tNSize);
+  buildConfigrationPayload(node, "energy", "total", name, "kWh", "{{value_json.today_energy_consumed_kwh}}", payload, buff_size, tNSize);
+}
+
+void MessageBuilder::getInsertionConfigurationPayload(const char* node, char* payload, uint16_t buff_size, uint8_t tNSize) {
+  char name[64];
+  strcpy(name, node);
+  strcat(name, "-Insertion");
+
+  buildConfigrationPayload(node, "energy", "total", name, "kWh", "{{value_json.today_energy_inserted_kwh}}", payload, buff_size, tNSize);
+}
+
+void MessageBuilder::getProductionConfigurationPayload(const char* node, char* payload, uint16_t buff_size, uint8_t tNSize) {
+  char name[64];
+  strcpy(name, node);
+  strcat(name, "-Production");
+
+  buildConfigrationPayload(node, "energy", "total", name, "kWh", "{{value_json.today_energy_produced_kwh}}", payload, buff_size, tNSize);
 }

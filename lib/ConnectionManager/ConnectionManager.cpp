@@ -167,4 +167,5 @@ void ConnectionManager::resetConfiguration() {
   LittleFS.format();
   // reset wifi settings
   wifiManager.resetSettings();
+
 }

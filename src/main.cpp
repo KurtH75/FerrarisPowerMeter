@@ -5,6 +5,7 @@
 #include <DoubleResetDetect.h>
 #include <NTPTime.h>
 #include <DisplayManager.h>
+#include <FerrarisRead.h>
 
 // maximum number of seconds between resets that
 // counts as a double reset 
@@ -16,7 +17,7 @@
 #define DRD_ADDRESS 0x00
 DoubleResetDetect drd(DRD_TIMEOUT, DRD_ADDRESS);
 
-#define DIGITALPIN D5
+#define SOLARPIN D5 //GPIO D0
 #define DEBUG true
 #define USE_SERIAL Serial
 
@@ -28,26 +29,42 @@ DisplayManager    displayManager;
 
 uint32_t previousTimestamp     = 0;
 uint8_t  previousDay           = 0;
-float    total_energy_kwh      = 0.0;
-float    today_energy_kwh      = 0.0;
+float    today_energy_consumed_kwh      = 0.0;
+float    today_energy_inserted_kwh      = 0.0;
+float    today_energy_produced_kwh, last_published_produced      = 0.0;
+
 float    powerInWatts          = 0.0;
-boolean  previousImpulse       = false;
+int  previousImpulse       = 0;
 boolean  timeIsTicking         = false;
+boolean  solar_pulse  = false;
 
 uint16_t maxPayloadBufferSize  = MqttClient::getMaxPayloadBufferSize();
 uint8_t  maxTopicNameSize      = MqttClient::getMaxTopicNameSize();
 
 char     hostname[32];
 
-char     energyTopicName[128];
-char     energyConfigPayload[512];
+char     consumptionTopicName[128];
+char     insertionTopicName[128];
+char     productionTopicName[128];
+
+
+//char     energyConfigPayload[512];
+char     productionConfigPayload[512];
+char     consumptionConfigPayload[512];
+char     insertionConfigPayload[512];
 char     powerTopicName[128];
 char     powerConfigPayload[512];
 char     stateTopicName[128];
 
-void setup () {
-  pinMode (DIGITALPIN, INPUT_PULLUP);
+void IRAM_ATTR pulse_isr() {
+  solar_pulse = true;
+}
 
+
+void setup () {
+  pinMode (SOLARPIN, INPUT_PULLUP);
+  attachInterrupt(SOLARPIN, pulse_isr, FALLING);
+  ferrarisReadInit();
   strcat(hostname, "MRT-Power-Meter-");
   strcat(hostname, String(ESP.getChipId()).c_str());
 
@@ -62,7 +79,7 @@ void setup () {
   connectionManager.init();
   ntpTime.init();
 
-  total_energy_kwh = connectionManager.config.actual_counter;
+  //total_energy_kwh = connectionManager.config.actual_counter;
 
   if(DEBUG) {
     USE_SERIAL.print("MQTT Server:    "); USE_SERIAL.println(connectionManager.config.mqtt_server);
@@ -73,8 +90,12 @@ void setup () {
     USE_SERIAL.print("Rotations:      "); USE_SERIAL.println(connectionManager.config.rotations_per_kwh);
   }
 
-  msgBuilder.getConfigTopicName(hostname, "energy", energyTopicName, maxTopicNameSize);
-  msgBuilder.getEnergyConfigurationPayload(hostname, energyConfigPayload, maxPayloadBufferSize, maxTopicNameSize);
+  msgBuilder.getConfigTopicName(hostname, "production", productionTopicName, maxTopicNameSize);
+  msgBuilder.getProductionConfigurationPayload(hostname, productionConfigPayload, maxPayloadBufferSize, maxTopicNameSize);
+  msgBuilder.getConfigTopicName(hostname, "consumption", consumptionTopicName, maxTopicNameSize);
+  msgBuilder.getConsumptionConfigurationPayload(hostname, consumptionConfigPayload, maxPayloadBufferSize, maxTopicNameSize);
+  msgBuilder.getConfigTopicName(hostname, "insertion", insertionTopicName, maxTopicNameSize);
+  msgBuilder.getInsertionConfigurationPayload(hostname, insertionConfigPayload, maxPayloadBufferSize, maxTopicNameSize);
   msgBuilder.getConfigTopicName(hostname, "power", powerTopicName, maxTopicNameSize);
   msgBuilder.getPowerConfigurationPayload(hostname, powerConfigPayload, maxPayloadBufferSize, maxTopicNameSize);
   msgBuilder.getStateTopicName(hostname, stateTopicName, maxTopicNameSize);
@@ -107,14 +128,16 @@ void publish() {
 
   if(mqttClient.isConnected()) {
     char statePayload[maxPayloadBufferSize];
-    msgBuilder.getStatePayload(hostname, powerInWatts, total_energy_kwh, today_energy_kwh, statePayload, maxPayloadBufferSize);
+    msgBuilder.getStatePayload(hostname, powerInWatts, today_energy_consumed_kwh, today_energy_inserted_kwh, today_energy_produced_kwh, statePayload, maxPayloadBufferSize);
 
-    mqttClient.publish(energyTopicName, energyConfigPayload, true);
+    mqttClient.publish(consumptionTopicName, consumptionConfigPayload, true);
+    mqttClient.publish(insertionTopicName, insertionConfigPayload, true);
+    mqttClient.publish(productionTopicName, productionConfigPayload, true);
     mqttClient.publish(powerTopicName, powerConfigPayload, true);
     mqttClient.publish(stateTopicName, statePayload, false);
 
     if(DEBUG) {
-      USE_SERIAL.printf("Published %.5f watts and %.5f kWh.", powerInWatts, total_energy_kwh);
+      USE_SERIAL.printf("Published %.5f watts and %.5f kWh.", powerInWatts, today_energy_consumed_kwh);
       USE_SERIAL.println();   
     }
   }
@@ -155,13 +178,14 @@ void loop () {
   * As long as the silver color of the rotary disc is recognized, the signal is HIGH,
   * if red (or a darker) color is detected, the signal turns to LOW.
   */
-  boolean _hasImpulse = !digitalRead(DIGITALPIN);
+  int _hasImpulse = ferrarisLoop();
 
-  if (_hasImpulse) {
+  if ((_hasImpulse == 1)&&(previousImpulse == 1)) {
+    //one full round of net consumption
     if(DEBUG) 
-      USE_SERIAL.println("Impulse detected.");
+      USE_SERIAL.println("Positive Impulse detected.");
 
-    if (!previousImpulse && timeIsTicking) {
+    //if (timeIsTicking) {
       /*
         The previous impulse is false so we only get the first positive impulse in a sequence.
         With timeIsTicking we ensure that we get the first full round.
@@ -171,10 +195,10 @@ void loop () {
         powerInWatts = getPowerInWatts(timestamp - previousTimestamp);
         float _energyInkWh  = getEnergyInKwhPerImpulse();
 
-        total_energy_kwh += _energyInkWh;
+        today_energy_consumed_kwh += _energyInkWh;
         if (previousDay != day_of_the_week)
-          today_energy_kwh = 0.0;
-        today_energy_kwh += _energyInkWh;  
+          today_energy_consumed_kwh = 0.0;
+        //today_energy_kwh += _energyInkWh;  
 
         publish();
 
@@ -184,25 +208,93 @@ void loop () {
           USE_SERIAL.printf("The actual power usage is %.2f watts.", powerInWatts);
           USE_SERIAL.println();
           USE_SERIAL.printf("The todays/total energy consumption is %.2f/%.2f kWh.", 
-                                                    today_energy_kwh, total_energy_kwh);
+                                                    today_energy_consumed_kwh, today_energy_inserted_kwh);
           USE_SERIAL.println();
         }
       }
-    }
+    //}
 
+    /*if (previousTimestamp == 0) {
+      if(DEBUG) 
+        USE_SERIAL.println("First round.... activating calculation.");
+      timeIsTicking = true;
+    }
+    */
+    // save timestamp
+    previousTimestamp = timestamp;
+    // save day of the week
+    previousDay = day_of_the_week;
+    
+  } //end if (hasImpulse)
+
+  if ((_hasImpulse == -1)&&(previousImpulse == -1)) {
+    if(DEBUG) 
+      USE_SERIAL.println("Return Impulse detected.");
+
+    //if (timeIsTicking) {
+      /*
+        The previous impulse is false so we only get the first positive impulse in a sequence.
+        With timeIsTicking we ensure that we get the first full round.
+      */
+
+      if(timestamp > previousTimestamp) {
+        powerInWatts = -(getPowerInWatts(timestamp - previousTimestamp));
+        float _energyInkWh  = getEnergyInKwhPerImpulse();
+
+        today_energy_inserted_kwh += _energyInkWh;
+        if (previousDay != day_of_the_week)
+          today_energy_inserted_kwh = 0.0;
+        //today_energy_kwh -= _energyInkWh;  
+
+        publish();
+
+        if(DEBUG) {
+          USE_SERIAL.printf("%s - %s.", date, time);
+          USE_SERIAL.println();
+          USE_SERIAL.printf("The actual power usage is %.2f watts.", powerInWatts);
+          USE_SERIAL.println();
+          USE_SERIAL.printf("The todays/total energy consumption is %.2f/%.2f kWh.", 
+                                                    today_energy_consumed_kwh, today_energy_inserted_kwh);
+          USE_SERIAL.println();
+        }
+      }
+    //}
+
+    /*
     if (previousTimestamp == 0) {
       if(DEBUG) 
         USE_SERIAL.println("First round.... activating calculation.");
       timeIsTicking = true;
     }
+    */
     // save timestamp
     previousTimestamp = timestamp;
     // save day of the week
     previousDay = day_of_the_week;
-
+    
   } //end if (hasImpulse)
-  
-  displayManager.updateDisplay(powerInWatts, total_energy_kwh, today_energy_kwh, date, time);
 
-  previousImpulse = _hasImpulse;
+
+  
+  displayManager.updateDisplay(powerInWatts, today_energy_consumed_kwh, today_energy_inserted_kwh, date, time);
+
+  if(_hasImpulse != 0) {
+    previousImpulse = _hasImpulse;
+    USE_SERIAL.println(_hasImpulse);
+  }
+
+if (solar_pulse && !digitalRead(SOLARPIN)){
+  today_energy_produced_kwh += 0.01;
+    USE_SERIAL.println("SPULSE!");
+  if (previousDay != day_of_the_week)
+          today_energy_produced_kwh = 0.0;
+  if ((last_published_produced + 0.1) < today_energy_produced_kwh){
+      publish();
+      last_published_produced = today_energy_produced_kwh; 
+    }
 }
+if (solar_pulse && digitalRead(SOLARPIN)) {
+  solar_pulse = false;
+}
+}
+
